@@ -1,6 +1,13 @@
 #!/bin/bash
 set -e
 
+# Check if being run as root
+if [ "$EUID" -eq 0 ]; then
+    echo "Please do not run this script with sudo"
+    echo "It will ask for sudo permissions when needed"
+    exit 1
+fi
+
 # Update this URL when a new version of Claude Desktop is released
 CLAUDE_DOWNLOAD_URL="https://storage.googleapis.com/osprey-downloads-c02f6a0d-347c-492b-a752-3e0651722e97/nest-win-x64/Claude-Setup-x64.exe"
 
@@ -10,16 +17,11 @@ if [ ! -f "/etc/debian_version" ]; then
     exit 1
 fi
 
-# Check for root/sudo
-if [ "$EUID" -ne 0 ]; then
-    echo "Please run with sudo to install dependencies"
-    exit 1
-fi
-
 # Print system information
 echo "System Information:"
 echo "Distribution: $(cat /etc/os-release | grep "PRETTY_NAME" | cut -d'"' -f2)"
 echo "Debian version: $(cat /etc/debian_version)"
+
 
 # Function to check if a command exists
 check_command() {
@@ -32,12 +34,28 @@ check_command() {
     fi
 }
 
+# Function to install system dependencies
+install_dependencies() {
+    local deps="$1"
+    echo "Installing system dependencies: $deps"
+    sudo apt update
+    sudo apt install -y $deps
+}
+
 # Check and install dependencies
-echo "Checking dependencies..."
+echo "Checking Node.js environment..."
+for cmd in node npm; do
+    if ! check_command "$cmd"; then
+        echo "❌ Node.js/npm not found. Please install Node.js"
+        exit 1
+    fi
+done
+
+echo "Checking system dependencies..."
 DEPS_TO_INSTALL=""
 
 # Check system package dependencies
-for cmd in p7zip wget wrestool icotool convert npx dpkg-deb; do
+for cmd in p7zip wget wrestool icotool convert dpkg-deb; do
     if ! check_command "$cmd"; then
         case "$cmd" in
             "p7zip")
@@ -52,9 +70,6 @@ for cmd in p7zip wget wrestool icotool convert npx dpkg-deb; do
             "convert")
                 DEPS_TO_INSTALL="$DEPS_TO_INSTALL imagemagick"
                 ;;
-            "npx")
-                DEPS_TO_INSTALL="$DEPS_TO_INSTALL nodejs npm"
-                ;;
             "dpkg-deb")
                 DEPS_TO_INSTALL="$DEPS_TO_INSTALL dpkg-dev"
                 ;;
@@ -64,22 +79,21 @@ done
 
 # Install system dependencies if any
 if [ ! -z "$DEPS_TO_INSTALL" ]; then
-    echo "Installing system dependencies: $DEPS_TO_INSTALL"
-    apt update
-    apt install -y $DEPS_TO_INSTALL
+    install_dependencies "$DEPS_TO_INSTALL"
     echo "System dependencies installed successfully"
 fi
 
+echo "Checking npm dependencies..."
 # Install electron globally via npm if not present
 if ! check_command "electron"; then
-    echo "Installing electron via npm..."
+    echo "Installing electron..."
     npm install -g electron
-    if ! check_command "electron"; then
-        echo "Failed to install electron. Please install it manually:"
-        echo "sudo npm install -g electron"
-        exit 1
-    fi
-    echo "Electron installed successfully"
+fi
+
+# Install asar if needed
+if ! check_command "asar"; then
+    echo "Installing @electron/asar..."
+    npm install -g @electron/asar
 fi
 
 # Extract version from the installer filename
@@ -102,12 +116,6 @@ mkdir -p "$INSTALL_DIR/lib/$PACKAGE_NAME"
 mkdir -p "$INSTALL_DIR/share/applications"
 mkdir -p "$INSTALL_DIR/share/icons"
 mkdir -p "$INSTALL_DIR/bin"
-
-# Install asar if needed
-if ! npm list -g asar > /dev/null 2>&1; then
-    echo "Installing asar package globally..."
-    npm install -g asar
-fi
 
 # Download Claude Windows installer
 echo "📥 Downloading Claude Desktop installer..."
@@ -173,7 +181,15 @@ cp "lib/net45/resources/app.asar" electron-app/
 cp -r "lib/net45/resources/app.asar.unpacked" electron-app/
 
 cd electron-app
-npx asar extract app.asar app.asar.contents
+
+# Check for asar installation and install if needed
+if ! command -v asar &> /dev/null; then
+    echo "Installing @electron/asar package..."
+    npm install @electron/asar
+    PATH="$PATH:$(pwd)/node_modules/.bin"
+fi
+
+asar extract app.asar app.asar.contents
 
 # Replace native module with stub implementation
 echo "Creating stub native module..."
@@ -224,51 +240,11 @@ mkdir -p app.asar.contents/resources
 cp ../lib/net45/resources/Tray* app.asar.contents/resources/
 
 # Repackage app.asar
-npx asar pack app.asar.contents app.asar
+asar pack app.asar.contents app.asar
 
 # Create native module with keyboard constants
 mkdir -p "$INSTALL_DIR/lib/$PACKAGE_NAME/app.asar.unpacked/node_modules/claude-native"
-cat > "$INSTALL_DIR/lib/$PACKAGE_NAME/app.asar.unpacked/node_modules/claude-native/index.js" << EOF
-// Stub implementation of claude-native using KeyboardKey enum values
-const KeyboardKey = {
-  Backspace: 43,
-  Tab: 280,
-  Enter: 261,
-  Shift: 272,
-  Control: 61,
-  Alt: 40,
-  CapsLock: 56,
-  Escape: 85,
-  Space: 276,
-  PageUp: 251,
-  PageDown: 250,
-  End: 83,
-  Home: 154,
-  LeftArrow: 175,
-  UpArrow: 282,
-  RightArrow: 262,
-  DownArrow: 81,
-  Delete: 79,
-  Meta: 187
-};
-
-Object.freeze(KeyboardKey);
-
-module.exports = {
-  getWindowsVersion: () => "10.0.0",
-  setWindowEffect: () => {},
-  removeWindowEffect: () => {},
-  getIsMaximized: () => false,
-  flashFrame: () => {},
-  clearFlashFrame: () => {},
-  showNotification: () => {},
-  setProgressBar: () => {},
-  clearProgressBar: () => {},
-  setOverlayIcon: () => {},
-  clearOverlayIcon: () => {},
-  KeyboardKey
-};
-EOF
+cp app.asar.contents/node_modules/claude-native/index.js "$INSTALL_DIR/lib/$PACKAGE_NAME/app.asar.unpacked/node_modules/claude-native/"
 
 # Copy app files
 cp app.asar "$INSTALL_DIR/lib/$PACKAGE_NAME/"
@@ -289,6 +265,11 @@ EOF
 # Create launcher script
 cat > "$INSTALL_DIR/bin/claude-desktop" << EOF
 #!/bin/bash
+
+# Source NVM
+export NVM_DIR="\$HOME/.nvm"
+[ -s "\$NVM_DIR/nvm.sh" ] && \. "\$NVM_DIR/nvm.sh"  # This loads nvm
+
 electron /usr/lib/claude-desktop/app.asar "\$@"
 EOF
 chmod +x "$INSTALL_DIR/bin/claude-desktop"
@@ -299,13 +280,14 @@ Package: claude-desktop
 Version: $VERSION
 Architecture: $ARCHITECTURE
 Maintainer: $MAINTAINER
-Depends: nodejs, npm, p7zip-full
+Depends: p7zip-full
+Recommends: nodejs, npm
 Description: $DESCRIPTION
  Claude is an AI assistant from Anthropic.
  This package provides the desktop interface for Claude.
  .
  Supported on Debian-based Linux distributions (Debian, Ubuntu, Linux Mint, MX Linux, etc.)
- Requires: nodejs (>= 12.0.0), npm
+ Note: Requires Node.js (>= 12.0.0) and npm, either system-installed or via version managers like nvm
 EOF
 
 # Build .deb package
